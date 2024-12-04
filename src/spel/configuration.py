@@ -62,11 +62,29 @@ def get_exec_run_file():
 
 
 def get_aida_vocab():
+    """
+    获取AIDA词汇表。
+    
+    该函数读取AIDA词汇表文件，并为每个词汇分配一个唯一的整数ID。
+    词汇表中每一行代表一个词汇，函数会将这些词汇与它们对应的ID存储在字典中。
+    
+    Returns:
+        dict: 包含词汇与对应ID的字典。
+    """
+    # 初始化词汇表字典，包含两个特殊项：'|||O|||' 表示未知词汇，'<pad>' 用于填充。
     mentions_vocab = dict({'|||O|||': 0, '<pad>': 1})
+    
+    # 获取词汇表文件路径。
     dictionary_file = get_resources_dir() / "vocab" / "aida.txt"
+    
+    # 打开词汇表文件以读取内容。
     dfile = dictionary_file.open("r")
+    
+    # 遍历文件中的每一行，为每个词汇分配一个唯一的ID。
     for _ad_element in dfile.read().split("\n"):
         mentions_vocab[_ad_element] = len(mentions_vocab)
+    
+    # 返回构建完成的词汇表字典。
     return mentions_vocab
 
 def get_ood_vocab():

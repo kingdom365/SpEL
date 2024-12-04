@@ -321,10 +321,55 @@ def get_dataset(dataset_name: str, split: str, batch_size: int, get_labels_with_
                                                                  batch_size=batch_size,
                                                                  collate_fn=collate_batch)
 
+def get_dataset_aida(split, batch_size, get_labels_with_high_model_score, label_size, load_distributed, world_size, rank):
+    def collate_batch(batch):
+        data = {}
+        for key in ["tokens", "mentions", "mention_entity_probs", "eval_mask", "candidates", "is_in_mention", "bioes"]:
+            data[key] = []
+        for annotated_line_in_file in batch:
+            data["tokens"].append(tokenizer.convert_tokens_to_ids(annotated_line_in_file["tokens"]))
+            data["mentions"].append([
+                [(dl_sa.mentions_vocab[x] if x not in dl_sa.aida_canonical_redirects else
+                  dl_sa.mentions_vocab[dl_sa.aida_canonical_redirects[x]])
+                 if x is not None and x not in ['Gmina_Żabno'] else dl_sa.mentions_vocab["|||O|||"] for x in el]
+                for el in annotated_line_in_file["mentions"]
+            ])
+            data["mention_entity_probs"].append(annotated_line_in_file["mention_entity_probs"])
+            data["eval_mask"].append(list(map(
+                lambda item: 1 if len(item) == 1 else 0, annotated_line_in_file["mention_probs"])))
+            is_in_mention = [1 if x != '|||O|||' else 0 for el, elp in zip(
+                annotated_line_in_file["mentions"], annotated_line_in_file["mention_entity_probs"])
+                             for x, y in zip(el, elp) if y == max(elp)]
+            data["is_in_mention"].append(is_in_mention)
+            data["bioes"].append(convert_is_in_mention_to_bioes(is_in_mention))
 
-def create_output_with_negative_examples(batch_entity_ids, batch_entity_probs, batch_size, maxlen, label_vocab_size,
+        maxlen = max([len(x) for x in data["tokens"]])
+        token_ids = torch.LongTensor([sample + [0] * (maxlen - len(sample)) for sample in data["tokens"]])
+        eval_mask = torch.LongTensor([sample + [0] * (maxlen - len(sample)) for sample in data["eval_mask"]])
+        is_in_mention = torch.LongTensor([sample + [0] * (maxlen - len(sample)) for sample in data["is_in_mention"]])
+        bioes = torch.LongTensor([sample + [2] * (maxlen - len(sample)) for sample in data["bioes"]])
+        if get_labels_with_high_model_score:
+            labels_with_high_model_score = get_labels_with_high_model_score(token_ids)
+        else:
+            labels_with_high_model_score = None
+        subword_mentions = create_output_with_negative_examples(
+            data["mentions"], data["mention_entity_probs"], token_ids.size(0), token_ids.size(1),
+            len(dl_sa.mentions_vocab), label_size, labels_with_high_model_score)
+        inputs = BatchEncoding({
+            'token_ids': token_ids,
+            'eval_mask': eval_mask,
+            'raw_mentions': data["mentions"],
+            'is_in_mention': is_in_mention,
+            "bioes": bioes
+        })
+        return inputs, subword_mentions
+    pass
+
+def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs, batch_size, maxlen, label_vocab_size,
                                          label_size, labels_with_high_model_score=None):
+    # 初始化一个有序字典，用于存储所有实体ID
     all_entity_ids = OrderedDict()
+    # 遍历批次中的每个项，为每个实体ID分配一个唯一的索引
     for batch_offset, (batch_item_token_item_entity_ids, batch_item_token_entity_probs) in enumerate(
             zip(batch_entity_ids, batch_entity_probs)
     ):
@@ -335,21 +380,27 @@ def create_output_with_negative_examples(batch_entity_ids, batch_entity_probs, b
                 if eid not in all_entity_ids:
                     all_entity_ids[eid] = len(all_entity_ids)
     # #####################################################
+    # 将所有实体ID转换为列表形式
     shared_label_ids = list(all_entity_ids.keys())
 
+    # 如果实体ID的数量小于所需标签数量，且提供了模型高得分标签，则添加这些标签作为负例
     if len(shared_label_ids) < label_size and labels_with_high_model_score is not None:
         negative_examples = set(labels_with_high_model_score)
         negative_examples.difference_update(shared_label_ids)
         shared_label_ids += list(negative_examples)
 
+    # 如果实体ID的数量仍然小于所需标签数量，则随机选择负例进行补充
     if len(shared_label_ids) < label_size:
         negative_samples = set(numpy.random.choice(label_vocab_size, label_size, replace=False))
         negative_samples.difference_update(shared_label_ids)
         shared_label_ids += list(negative_samples)
 
+    # 确保标签数量不超过所需数量
     shared_label_ids = shared_label_ids[: label_size]
 
+    # all_entity_ids是所有正例，shared_label_ids是负例（没有mention链接到）
     all_batch_entity_ids, batch_shared_label_ids = all_entity_ids, shared_label_ids
+    # 根据标签数量初始化标签概率张量
     if label_size > 0:
         label_probs = torch.zeros(batch_size, maxlen, len(batch_shared_label_ids))
     else:
@@ -369,7 +420,99 @@ def create_output_with_negative_examples(batch_entity_ids, batch_entity_probs, b
                     torch.LongTensor(list(map(all_batch_entity_ids.__getitem__, token_entity_ids)))
                 ] = torch.Tensor(token_entity_probs)
 
+    # 将标签ID转换为张量
     label_ids = torch.LongTensor(batch_shared_label_ids)
+    # 返回包含ids、probs和dictionary的BatchEncoding对象
+
+    # 获取所有label_ids对应的entity_desc输入序列，需要roberta的编码序列
+    label_desc = torch.LongTensor(
+        
+    )
+
+    return BatchEncoding({
+        "ids": label_ids,  # of size label_size
+        "probs": label_probs,  # of size input_batch_size x input_max_len x label_size
+        "dictionary": {v: k for k, v in all_batch_entity_ids.items()},  # contains all original ids for mentions in batch
+        "desc": []
+    })
+
+
+def create_output_with_negative_examples(batch_entity_ids, batch_entity_probs, batch_size, maxlen, label_vocab_size,
+                                         label_size, labels_with_high_model_score=None):
+    """
+    创建包含负样本的输出。
+
+    该函数旨在为模型生成一个批次的输入数据，其中包含了从实体链接任务中提取的正例和负例。
+    负例是通过随机选择和模型高得分标签来补充，以达到指定的标签大小。
+
+    参数:
+    - batch_entity_ids: 一个列表，包含了批次中每个项的实体ID。
+    - batch_entity_probs: 一个列表，包含了批次中每个项的实体概率。
+    - batch_size: 批次大小。
+    - maxlen: 输入序列的最大长度。
+    - label_vocab_size: 标签词汇表的大小。
+    - label_size: 每个输入项的标签数量，包括正例和负例。
+    - labels_with_high_model_score: 可选参数，包含模型高得分的标签。
+
+    返回:
+    - BatchEncoding对象，包含了ids、probs和dictionary三个字段。
+    """
+    # 初始化一个有序字典，用于存储所有实体ID
+    all_entity_ids = OrderedDict()
+    # 遍历批次中的每个项，为每个实体ID分配一个唯一的索引
+    for batch_offset, (batch_item_token_item_entity_ids, batch_item_token_entity_probs) in enumerate(
+            zip(batch_entity_ids, batch_entity_probs)
+    ):
+        for tok_id, (token_entity_ids, token_entity_probs) in enumerate(
+                zip(batch_item_token_item_entity_ids, batch_item_token_entity_probs)
+        ):
+            for eid in token_entity_ids:
+                if eid not in all_entity_ids:
+                    all_entity_ids[eid] = len(all_entity_ids)
+    # #####################################################
+    # 将所有实体ID转换为列表形式
+    shared_label_ids = list(all_entity_ids.keys())
+
+    # 如果实体ID的数量小于所需标签数量，且提供了模型高得分标签，则添加这些标签作为负例
+    if len(shared_label_ids) < label_size and labels_with_high_model_score is not None:
+        negative_examples = set(labels_with_high_model_score)
+        negative_examples.difference_update(shared_label_ids)
+        shared_label_ids += list(negative_examples)
+
+    # 如果实体ID的数量仍然小于所需标签数量，则随机选择负例进行补充
+    if len(shared_label_ids) < label_size:
+        negative_samples = set(numpy.random.choice(label_vocab_size, label_size, replace=False))
+        negative_samples.difference_update(shared_label_ids)
+        shared_label_ids += list(negative_samples)
+
+    # 确保标签数量不超过所需数量
+    shared_label_ids = shared_label_ids[: label_size]
+
+    # all_entity_ids是所有正例，shared_label_ids是负例（没有mention链接到）
+    all_batch_entity_ids, batch_shared_label_ids = all_entity_ids, shared_label_ids
+    # 根据标签数量初始化标签概率张量
+    if label_size > 0:
+        label_probs = torch.zeros(batch_size, maxlen, len(batch_shared_label_ids))
+    else:
+        label_probs = torch.zeros(batch_size, maxlen, label_vocab_size)
+    # loop through the batch x tokens x (label_ids, label_probs)
+    for batch_offset, (batch_item_token_item_entity_ids, batch_item_token_entity_probs) in enumerate(
+            zip(batch_entity_ids, batch_entity_probs)
+    ):
+        # loop through tokens x (label_ids, label_probs)
+        for tok_id, (token_entity_ids, token_entity_probs) in enumerate(
+                zip(batch_item_token_item_entity_ids, batch_item_token_entity_probs)):
+            if label_size is None:
+                label_probs[batch_offset][tok_id][torch.LongTensor(token_entity_ids)] = torch.Tensor(
+                    batch_item_token_item_entity_ids)
+            else:
+                label_probs[batch_offset][tok_id][
+                    torch.LongTensor(list(map(all_batch_entity_ids.__getitem__, token_entity_ids)))
+                ] = torch.Tensor(token_entity_probs)
+
+    # 将标签ID转换为张量
+    label_ids = torch.LongTensor(batch_shared_label_ids)
+    # 返回包含ids、probs和dictionary的BatchEncoding对象
     return BatchEncoding({
         "ids": label_ids,  # of size label_size
         "probs": label_probs,  # of size input_batch_size x input_max_len x label_size
