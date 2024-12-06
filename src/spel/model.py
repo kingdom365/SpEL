@@ -55,7 +55,8 @@ class SpELAnnotator:
             self.softmax = nn.Softmax(dim=-1)
 
             # [CLS] entity_title [SEP] entity_desc [SEP]
-            self.bert_out_tokenzier = AutoTokenizer.from_pretrained(base_model)
+            # self.bert_out_tokenzier = AutoTokenizer.from_pretrained(base_model)
+            self.desc_embs = [dl_sa.mention_vocab]
             self.bert_out = AutoModelForMaskedLM.from_pretrained(base_model, output_hidden_states=True,
                                                                  cache_dir=get_checkpoints_dir() / 'hf').to(device)
             self.disable_out_roberta_lm_head()
@@ -244,17 +245,8 @@ class SpELAnnotator:
     def get_model_desc_raw_logits_training(self, token_ids, descs, label_probs):
         print(token_ids.shape)
         enc = self.bert_lm(token_ids).hidden_states[-1]
-        # desc: tensor(batch_size, batch_entity_num, desc_max_length=256)
-        descs_vocab_vec = []
-        # print('descs shape : ', descs.shape)
-        for desc in descs:
-            input_ids = desc["input_ids"].to(self.current_device)
-            attention_mask = desc["attention_mask"].to(self.current_device)
-            print("input_ids shape : ", input_ids.shape)
-            print("attention_mask shape : ", attention_mask.shape)
-            output = self.bert_out(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True).hidden_states[-1][:, 0, :]
-            descs_vocab_vec.append(output.cpu())
-        out = torch.cat(descs_vocab_vec).to(self.current_device)
+        print('descs shape : ', descs.shape)
+        out = self.bert_out(descs).hidden_states[-1][:, 0, :]
         # out = self.bert_out(descs).hidden_states[-1]
         logits = enc.matmul(out.transpose(0, 1))
         return logits
@@ -274,7 +266,7 @@ class SpELAnnotator:
 
     def get_model_logits_inference(self, raw_logits, hidden_states, k_for_top_k_to_keep, token_offsets=None) \
             -> List[SubwordAnnotation]:
-        # hidden_states is not used in this function but provided for the classes inheriting SpELAnnotator.
+        #vocab hidden_states is not used in this function but provided for the classes inheriting SpELAnnotator.
         logits = self.softmax(raw_logits)
         # The following line could possibly cause errors in torch version 1.13.1
         # see https://github.com/pytorch/pytorch/issues/95455 for more information

@@ -59,6 +59,7 @@ class StaticAccess:
         self.mentions_vocab, self.mentions_itos = None, None
         self.mentions_desc_vocab = None
         self.id_desc_map = None
+        self.precomputed_desc_embs = None   # 利用RoBERTa本身已经具有的
         self.set_vocab_and_itos_to_all()
         self.aida_canonical_redirects = get_aida_train_canonical_redirects()
         self._all_vocab_mask_for_aida = None
@@ -342,7 +343,7 @@ def create_id_desc_map():
             text=title,
             text_pair=desc,
             add_special_tokens=True,
-            max_length=256,
+            max_length=128,
             padding='max_length',
             truncation=True,
             return_attention_mask=True,
@@ -362,13 +363,17 @@ def create_id_desc_map():
             text=title,
             text_pair=desc,
             add_special_tokens=True,
-            max_length=256,
+            max_length=128,
             padding='max_length',
             truncation=True,
             return_attention_mask=True,
             return_tensors='pt')
         ret_id_desc_map[idx] = token_seq
     dl_sa.id_desc_map = ret_id_desc_map
+
+def precompute_aida_desc_embs():
+    
+    pass
 
 def get_dataset_aida(split: str, batch_size: int, get_labels_with_high_model_score=None,
                 label_size: int = 0, load_distributed: bool = False, world_size: int = 1, rank: int = 0,
@@ -408,8 +413,8 @@ def get_dataset_aida(split: str, batch_size: int, get_labels_with_high_model_sco
             labels_with_high_model_score = get_labels_with_high_model_score(token_ids)
         else:
             labels_with_high_model_score = None
-        subword_mentions = create_desc_emb_with_negative_examples(
-            data["mentions"], data["mention_entity_probs"], dl_sa.id_desc_map, token_ids.size(0), token_ids.size(1),
+        subword_mentions = create_output_with_negative_examples(
+            data["mentions"], data["mention_entity_probs"], token_ids.size(0), token_ids.size(1),
             len(dl_sa.mentions_vocab), label_size, labels_with_high_model_score)
         inputs = BatchEncoding({
             'token_ids': token_ids,
@@ -455,8 +460,7 @@ def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs,
     shared_label_ids = list(all_entity_ids.keys())
     # id对应的desc
     # print(id_desc_maps)
-    # shared_label_ids_desc = torch.LongTensor([id_desc_maps[idx] for idx in all_entity_ids.keys()])
-    shared_label_ids_desc = [id_desc_maps[idx] for idx in all_entity_ids.keys()]
+    # shared_label_ids_desc = [id_desc_maps[idx]["input_ids"].squeeze(0) for idx in all_entity_ids.keys()]
 
     # 如果实体ID的数量小于所需标签数量，且提供了模型高得分标签，则添加这些标签作为负例
     if len(shared_label_ids) < label_size and labels_with_high_model_score is not None:
@@ -467,7 +471,7 @@ def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs,
         # shared_label_ids_desc = torch.cat([shared_label_ids_desc, torch.LongTensor(
         #     [id_desc_maps[idx] for idx in negative_examples]
         # )])
-        shared_label_ids_desc += [id_desc_maps[idx] for idx in negative_examples]
+        # shared_label_ids_desc += [id_desc_maps[idx]["input_ids"].squeeze(0) for idx in negative_examples]
 
     # 如果实体ID的数量仍然小于所需标签数量，则随机选择负例进行补充
     if len(shared_label_ids) < label_size:
@@ -478,11 +482,15 @@ def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs,
         # shared_label_ids_desc = torch.cat([shared_label_ids_desc, torch.LongTensor(
         #     [id_desc_maps[idx] for idx in negative_examples]
         # )])
-        shared_label_ids_desc += [id_desc_maps[idx] for idx in negative_examples]
+        # shared_label_ids_desc += [id_desc_maps[idx]["input_ids"].squeeze(0) for idx in negative_examples]
 
     # 确保标签数量不超过所需数量
     shared_label_ids = shared_label_ids[: label_size]
-    shared_label_ids_desc = shared_label_ids_desc[: label_size]
+    # shared_label_ids_desc = shared_label_ids_desc[: label_size]
+    shared_label_ids_desc = [id_desc_maps[idx]["input_ids"].squeeze(0) for idx in shared_label_ids]
+
+    print('shared_label_ids len : ', len(shared_label_ids))
+    print('shared_label_ids_desc len : ', len(shared_label_ids_desc))
 
     # all_entity_ids是所有正例，shared_label_ids是负例（没有mention链接到）
     all_batch_entity_ids, batch_shared_label_ids = all_entity_ids, shared_label_ids
@@ -507,13 +515,19 @@ def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs,
                 ] = torch.Tensor(token_entity_probs)
 
     # 将标签ID转换为张量
+    print(shared_label_ids_desc[0].shape)
+    print('desc len : ', len(shared_label_ids_desc))
     label_ids = torch.LongTensor(batch_shared_label_ids)
+    print('label_ids shape : ', label_ids.shape)
+    desc_embs = torch.stack(shared_label_ids_desc)
+    print('desc_embs shape : ', desc_embs.shape)
+    # shared_label_ids_desc = torch.LongTensor(shared_label_ids_desc)
     # 返回包含ids、probs和dictionary的BatchEncoding对象
     return BatchEncoding({
         "ids": label_ids,  # of size label_size
         "probs": label_probs,  # of size input_batch_size x input_max_len x label_size
         "dictionary": {v: k for k, v in all_batch_entity_ids.items()},  # contains all original ids for mentions in batch
-        "desc": shared_label_ids_desc
+        "desc": desc_embs
     })
 
 
