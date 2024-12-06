@@ -2,9 +2,11 @@ import os
 import torch
 import pathlib
 import json
+import pickle
 from datetime import date
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda', 1)
 
 AIDA_CANONICAL_REDIRECTS = None
 OOD_CANONICAL_REDIRECTS = None
@@ -87,6 +89,23 @@ def get_aida_vocab():
     # 返回构建完成的词汇表字典。
     return mentions_vocab
 
+def get_aida_vocab_with_desc() -> dict[str, str]:
+    mentions_desc_vocab = dict()
+    dictionary_dir = get_resources_dir() / 'vocab' / 'json_texts'
+    with os.scandir(dictionary_dir) as entires:
+        for entry in entires:
+            if entry.is_file():
+                print(entry.name)
+                with open(os.path.join(dictionary_dir, entry.name), 'r') as f:
+                    mid_dict = json.load(f)                
+                    for k, v in mid_dict.items():
+                        if k in mentions_desc_vocab:
+                            print("Dupilicate key! ", k)
+                        mentions_desc_vocab[k] = v
+    mentions_desc_vocab['|||O|||'] = "|||O|||"
+    mentions_desc_vocab['<pad>'] = "<pad>"
+    return mentions_desc_vocab
+                    
 def get_ood_vocab():
     # This function might be used if one is interested in testing out the "masking all the candidates not in our
     #   expected entity set" which is mentioned in the footnote of section 4.1 of the paper.

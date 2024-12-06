@@ -10,7 +10,7 @@ import string
 from enum import Enum
 from tqdm import tqdm
 
-from spel.data_loader import get_dataset, tokenizer, dl_sa
+from spel.data_loader import get_dataset, tokenizer, dl_sa, get_dataset_aida
 from spel.span_annotation import SubwordAnnotation, WordAnnotation, PhraseAnnotation
 from spel.aida import AIDADataset
 from spel.configuration import get_resources_dir
@@ -123,14 +123,15 @@ def store_validation_data_wiki(checkpoints_root, batch_size, label_size, is_trai
         return dataset_name
     print("Caching the validation data ...")
     if is_training:
+        # is_training = True为前两个finetune阶段
         valid_iter = tqdm(get_dataset(
             dataset_name='enwiki', split='valid', batch_size=batch_size, label_size=label_size,
             use_retokenized_wikipedia_data=use_retokenized_wikipedia_data))
     else:
-        valid_iter = tqdm(get_dataset(dataset_name='aida', split='valid', batch_size=batch_size, label_size=label_size))
+        valid_iter = tqdm(get_dataset_aida(dataset_name='aida', split='valid', batch_size=batch_size, label_size=label_size))
     for ind, (inputs, subword_mentions) in enumerate(valid_iter):
         with open(os.path.join(checkpoints_root, dataset_name, f"{ind}"), "wb") as store_file:
-            pickle.dump((inputs.token_ids.cpu(), subword_mentions.ids.cpu(), subword_mentions.probs.cpu(),
+            pickle.dump((inputs.token_ids.cpu(), subword_mentions.ids.cpu(), subword_mentions.probs.cpu(), subword_mentions.desc.cpu(),
                          inputs.eval_mask.cpu(), subword_mentions.dictionary, inputs.raw_mentions,
                          inputs.is_in_mention.cpu(), inputs.bioes.cpu()), store_file,
                         protocol=pickle.HIGHEST_PROTOCOL)
@@ -276,6 +277,124 @@ def normalize_sentence_for_moses_alignment(sentence, normalize_for_chinese_chara
                 sentence = sentence.replace(k, v)
     return sentence
 
+def chunk_annotate_and_merge_to_phrase_desc(model, sentence, k_for_top_k_to_keep=5, normalize_for_chinese_characters=False):
+    sentence = sentence.rstrip()
+    sentence = normalize_sentence_for_moses_alignment(sentence, normalize_for_chinese_characters)
+    simple_split_words = moses_tokenize(sentence)
+    sentence = sentence.replace('\u010a', '\n')
+    tokenized_mention = tokenizer(sentence)
+    tokens_offsets = list(zip(tokenized_mention.tokens(), tokenized_mention.encodings[0].offsets))
+    subword_to_word_mapping = get_subword_to_word_mapping(tokenized_mention.tokens(), sentence)
+    chunks = [tokens_offsets[i: i + model.text_chunk_length] for i in range(
+        0, len(tokens_offsets), model.text_chunk_length - model.text_chunk_overlap)]
+    result = []
+    last_overlap = []
+    logits = []
+    # ########################################################################################################
+    # Covert each chunk to tensors, predict the labels, and merge the overlaps (keep conflicting predictions).
+    # ########################################################################################################
+    for chunk in chunks:
+        subword_ids = [tokenizer.convert_tokens_to_ids([x[0] for x in chunk])]
+        logits = model.annotate_subword_ids_desc(
+            subword_ids, k_for_top_k_to_keep, chunk)
+        if last_overlap:
+            result.extend(_process_last_overlap(model.text_chunk_overlap, last_overlap, logits))
+        else:
+            result.extend([(x,) for x in logits[:model.text_chunk_overlap]])
+        if len(logits) > 2 * model.text_chunk_overlap:
+            result.extend([(x,) for x in logits[model.text_chunk_overlap:-model.text_chunk_overlap]])
+            last_overlap = logits[-model.text_chunk_overlap:]
+        else:
+            result.extend([(x,) for x in logits[model.text_chunk_overlap:]])
+            last_overlap = []
+        logits = []
+    result.extend(_process_last_overlap(model.text_chunk_overlap, last_overlap, logits))
+    # ########################################################################################################
+    # Resolve the overlap merge conflicts using the model prediction probability
+    # ########################################################################################################
+    final_result = []
+    for p_ind, prediction in enumerate(result):
+        if len(prediction) == 1:
+            final_result.append(prediction[0])
+        else:
+            p_found = False
+            for p in prediction:
+                if p == final_result[-1] or (p_ind + 1 < len(result) and p in result[p_ind + 1]):
+                    # It is equal to the one in the left or in the one to the right
+                    final_result.append(p)
+                    p_found = True
+                    break
+            if not p_found:  # choose the one the model is more confident about
+                final_result.append(sorted(prediction, key=lambda x: x.item_probability(), reverse=True)[0])
+    # ########################################################################################################
+    # Convert the model predictions (subword-level) to valid GERBIL annotation spans (continuous char-level)
+    # ########################################################################################################
+    tokens_offsets = tokens_offsets[1:-1]
+    final_result = final_result[1:]
+    # last_step_annotations = []
+    word_annotations = [WordAnnotation(final_result[m[0]:m[1]], tokens_offsets[m[0]:m[1]])
+                        for m in subword_to_word_mapping]
+    # ########################################################################################################
+    #                    MAKING SURE WORDS ARE NOT BROKEN IN SEPARATE PHRASES!
+    # ########################################################################################################
+    w_p_1 = 0
+    w_p_2 = 0
+    w_2_buffer = ""
+    w_1_buffer = ""
+    while w_p_1 < len(word_annotations) and w_p_2 < len(simple_split_words):
+        w_1 = word_annotations[w_p_1]
+        w_2 = normalize(simple_split_words[w_p_2]).strip()
+        w_1_word_string = normalize(w_1.word_string).strip()
+        if w_1_word_string == w_2:
+            w_p_1 += 1
+            w_p_2 += 1
+        elif w_1_buffer and w_2_buffer and normalize(
+                w_1_buffer + w_1.word_string).strip() == normalize(w_2_buffer + simple_split_words[w_p_2]).strip():
+            w_p_1 += 1
+            w_p_2 += 1
+            w_1_buffer = ""
+            w_2_buffer = ""
+        elif w_2_buffer and w_1_word_string == normalize(w_2_buffer + simple_split_words[w_p_2]).strip():
+            w_p_1 += 1
+            w_p_2 += 1
+            w_2_buffer = ""
+        elif w_1_buffer and normalize(w_1_buffer + w_1.word_string).strip() == w_2:
+            w_p_1 += 1
+            w_p_2 += 1
+            w_1_buffer = ""
+        elif w_1_buffer and len(w_2) < len(normalize(w_1_buffer + w_1.word_string).strip()):
+            w_2_buffer += simple_split_words[w_p_2]
+            w_p_2 += 1
+        elif len(w_2) < len(w_1_word_string):
+            w_2_buffer += simple_split_words[w_p_2]
+            w_p_2 += 1
+        # Connecting the "." in between the names to the word it belongs to.
+        elif len(w_2) > len(w_1_word_string) and w_p_1 + 1 < len(word_annotations) \
+                and word_annotations[w_p_1 + 1].word_string == ".":
+            word_annotations[w_p_1 + 1] = WordAnnotation(
+                word_annotations[w_p_1].annotations + word_annotations[w_p_1 + 1].annotations,
+                word_annotations[w_p_1].token_offsets + word_annotations[w_p_1 + 1].token_offsets)
+            word_annotations[w_p_1].annotations = []
+            word_annotations[w_p_1].token_offsets = []
+            w_p_1 += 1
+        elif len(w_2) > len(w_1_word_string) and w_p_1 + 1 < len(word_annotations):
+            w_1_buffer += w_1.word_string
+            w_p_1 += 1
+        elif w_2_buffer and normalize(word_annotations[w_p_1].word_string + word_annotations[w_p_1 + 1].word_string).strip():
+            w_p_1 += 2
+            w_2_buffer = ""
+        else:
+            raise ValueError("This should not happen!")
+    # ################################################################################################################
+    phrase_annotations = []
+    for w in word_annotations:
+        if not w.annotations:
+            continue
+        if phrase_annotations and phrase_annotations[-1].resolved_annotation == w.resolved_annotation:
+            phrase_annotations[-1].add(w)
+        else:
+            phrase_annotations.append(PhraseAnnotation(w))
+    return phrase_annotations
 
 def chunk_annotate_and_merge_to_phrase(model, sentence, k_for_top_k_to_keep=5, normalize_for_chinese_characters=False):
     sentence = sentence.rstrip()

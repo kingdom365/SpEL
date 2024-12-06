@@ -47,7 +47,8 @@ from torchtext.utils import download_from_url
 from transformers import AutoTokenizer, BatchEncoding
 
 from spel.configuration import (get_aida_plus_wikipedia_plus_out_of_domain_vocab, get_aida_train_canonical_redirects,
-                                get_aida_vocab, get_ood_vocab, get_checkpoints_dir, get_base_model_name, device)
+                                get_aida_vocab, get_ood_vocab, get_checkpoints_dir, get_base_model_name, device,
+                                get_aida_vocab_with_desc)
 
 BERT_MODEL_NAME = get_base_model_name()
 MAX_SPAN_ANNOTATION_SIZE = 4
@@ -56,6 +57,8 @@ MAX_SPAN_ANNOTATION_SIZE = 4
 class StaticAccess:
     def __init__(self):
         self.mentions_vocab, self.mentions_itos = None, None
+        self.mentions_desc_vocab = None
+        self.id_desc_map = None
         self.set_vocab_and_itos_to_all()
         self.aida_canonical_redirects = get_aida_train_canonical_redirects()
         self._all_vocab_mask_for_aida = None
@@ -70,6 +73,15 @@ class StaticAccess:
         aida_mentions_vocab = get_aida_vocab()
         aida_mentions_itos = [w[0] for w in sorted(aida_mentions_vocab.items(), key=lambda x: x[1])]
         return aida_mentions_vocab, aida_mentions_itos
+
+    @staticmethod
+    def get_aida_desc_vocab_and_itos():
+        # {entity_name: desc(128)}
+        aida_mentions_desc_vocab = get_aida_vocab_with_desc()
+        return aida_mentions_desc_vocab
+
+    def shrink_desc_vocab_to_aida(self):
+        self.mentions_desc_vocab = self.get_aida_desc_vocab_and_itos()
 
     def shrink_vocab_to_aida(self):
         self.mentions_vocab, self.mentions_itos = self.get_aida_vocab_and_itos()
@@ -321,19 +333,63 @@ def get_dataset(dataset_name: str, split: str, batch_size: int, get_labels_with_
                                                                  batch_size=batch_size,
                                                                  collate_fn=collate_batch)
 
-def get_dataset_aida(split, batch_size, get_labels_with_high_model_score, label_size, load_distributed, world_size, rank):
+def create_id_desc_map():
+    # 完成新的映射表，并将desc字符串转为token序列
+    ret_id_desc_map = dict()
+    for title, desc in dl_sa.mentions_desc_vocab.items():
+        idx = dl_sa.mentions_vocab[title]
+        token_seq = tokenizer.encode_plus(
+            text=title,
+            text_pair=desc,
+            add_special_tokens=True,
+            max_length=256,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt')
+        ret_id_desc_map[idx] = token_seq
+    # (entity_id: desc_tensor)
+    ret_id_desc_map = dict(sorted(ret_id_desc_map.items()))
+    desc_idxs = set([i for i in range(len(dl_sa.mentions_vocab))])
+    for k, v in ret_id_desc_map.items():
+        if k in desc_idxs:
+            desc_idxs.remove(k)
+    print(desc_idxs)
+    for idx in desc_idxs:
+        title = 'NIL'
+        desc = 'nil'
+        token_seq = tokenizer.encode_plus(
+            text=title,
+            text_pair=desc,
+            add_special_tokens=True,
+            max_length=256,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt')
+        ret_id_desc_map[idx] = token_seq
+    dl_sa.id_desc_map = ret_id_desc_map
+
+def get_dataset_aida(split: str, batch_size: int, get_labels_with_high_model_score=None,
+                label_size: int = 0, load_distributed: bool = False, world_size: int = 1, rank: int = 0,
+                use_retokenized_wikipedia_data: bool = False):
+
+    if not load_distributed or rank == 0:
+        print(f"Initializing the aida/{split} dataset ...")
     def collate_batch(batch):
         data = {}
         for key in ["tokens", "mentions", "mention_entity_probs", "eval_mask", "candidates", "is_in_mention", "bioes"]:
             data[key] = []
         for annotated_line_in_file in batch:
             data["tokens"].append(tokenizer.convert_tokens_to_ids(annotated_line_in_file["tokens"]))
+            # 将entity的mention id打包
             data["mentions"].append([
                 [(dl_sa.mentions_vocab[x] if x not in dl_sa.aida_canonical_redirects else
                   dl_sa.mentions_vocab[dl_sa.aida_canonical_redirects[x]])
                  if x is not None and x not in ['Gmina_Żabno'] else dl_sa.mentions_vocab["|||O|||"] for x in el]
                 for el in annotated_line_in_file["mentions"]
             ])
+            # (entity_name, desc) <==> (entity_name, id) ====> (id, desc)
             data["mention_entity_probs"].append(annotated_line_in_file["mention_entity_probs"])
             data["eval_mask"].append(list(map(
                 lambda item: 1 if len(item) == 1 else 0, annotated_line_in_file["mention_probs"])))
@@ -352,8 +408,8 @@ def get_dataset_aida(split, batch_size, get_labels_with_high_model_score, label_
             labels_with_high_model_score = get_labels_with_high_model_score(token_ids)
         else:
             labels_with_high_model_score = None
-        subword_mentions = create_output_with_negative_examples(
-            data["mentions"], data["mention_entity_probs"], token_ids.size(0), token_ids.size(1),
+        subword_mentions = create_desc_emb_with_negative_examples(
+            data["mentions"], data["mention_entity_probs"], dl_sa.id_desc_map, token_ids.size(0), token_ids.size(1),
             len(dl_sa.mentions_vocab), label_size, labels_with_high_model_score)
         inputs = BatchEncoding({
             'token_ids': token_ids,
@@ -363,9 +419,24 @@ def get_dataset_aida(split, batch_size, get_labels_with_high_model_score, label_
             "bioes": bioes
         })
         return inputs, subword_mentions
-    pass
+    create_id_desc_map()
+    if not load_distributed or rank == 0:
+        print(f"Done initializing the aida/{split} dataset ...")
+    aida_dataset = AIDA20230827
+    aida_dataset_config = AIDA20230827Config
+    d_size = aida_dataset_config.NUM_LINES[split]
+    dataset_ = DistributableDataset(aida_dataset(split=split, root=get_checkpoints_dir()), d_size, world_size, rank) \
+        if load_distributed else aida_dataset(split=split, root=get_checkpoints_dir())
+    return DataLoader(dataset_, batch_size=batch_size, collate_fn=collate_batch,
+                      sampler=DistributedSampler(dataset_, num_replicas=world_size, rank=rank)) \
+        if load_distributed and split == "train" else DataLoader(aida_dataset(split=split, root=get_checkpoints_dir()),
+                                                                 batch_size=batch_size,
+                                                                 collate_fn=collate_batch)
 
-def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs, batch_size, maxlen, label_vocab_size,
+
+
+def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs, id_desc_maps, 
+                                           batch_size, maxlen, label_vocab_size,
                                          label_size, labels_with_high_model_score=None):
     # 初始化一个有序字典，用于存储所有实体ID
     all_entity_ids = OrderedDict()
@@ -382,21 +453,36 @@ def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs,
     # #####################################################
     # 将所有实体ID转换为列表形式
     shared_label_ids = list(all_entity_ids.keys())
+    # id对应的desc
+    # print(id_desc_maps)
+    # shared_label_ids_desc = torch.LongTensor([id_desc_maps[idx] for idx in all_entity_ids.keys()])
+    shared_label_ids_desc = [id_desc_maps[idx] for idx in all_entity_ids.keys()]
 
     # 如果实体ID的数量小于所需标签数量，且提供了模型高得分标签，则添加这些标签作为负例
     if len(shared_label_ids) < label_size and labels_with_high_model_score is not None:
         negative_examples = set(labels_with_high_model_score)
         negative_examples.difference_update(shared_label_ids)
         shared_label_ids += list(negative_examples)
+        # shared_label_ids_desc += list(dl_sa.mentions_desc_vocab[idx] for idx in negative_examples)
+        # shared_label_ids_desc = torch.cat([shared_label_ids_desc, torch.LongTensor(
+        #     [id_desc_maps[idx] for idx in negative_examples]
+        # )])
+        shared_label_ids_desc += [id_desc_maps[idx] for idx in negative_examples]
 
     # 如果实体ID的数量仍然小于所需标签数量，则随机选择负例进行补充
     if len(shared_label_ids) < label_size:
         negative_samples = set(numpy.random.choice(label_vocab_size, label_size, replace=False))
         negative_samples.difference_update(shared_label_ids)
         shared_label_ids += list(negative_samples)
+        # shared_label_ids_desc += list(id_desc_maps[idx] for idx in negative_examples)
+        # shared_label_ids_desc = torch.cat([shared_label_ids_desc, torch.LongTensor(
+        #     [id_desc_maps[idx] for idx in negative_examples]
+        # )])
+        shared_label_ids_desc += [id_desc_maps[idx] for idx in negative_examples]
 
     # 确保标签数量不超过所需数量
     shared_label_ids = shared_label_ids[: label_size]
+    shared_label_ids_desc = shared_label_ids_desc[: label_size]
 
     # all_entity_ids是所有正例，shared_label_ids是负例（没有mention链接到）
     all_batch_entity_ids, batch_shared_label_ids = all_entity_ids, shared_label_ids
@@ -423,17 +509,11 @@ def create_desc_emb_with_negative_examples(batch_entity_ids, batch_entity_probs,
     # 将标签ID转换为张量
     label_ids = torch.LongTensor(batch_shared_label_ids)
     # 返回包含ids、probs和dictionary的BatchEncoding对象
-
-    # 获取所有label_ids对应的entity_desc输入序列，需要roberta的编码序列
-    label_desc = torch.LongTensor(
-        
-    )
-
     return BatchEncoding({
         "ids": label_ids,  # of size label_size
         "probs": label_probs,  # of size input_batch_size x input_max_len x label_size
         "dictionary": {v: k for k, v in all_batch_entity_ids.items()},  # contains all original ids for mentions in batch
-        "desc": []
+        "desc": shared_label_ids_desc
     })
 
 

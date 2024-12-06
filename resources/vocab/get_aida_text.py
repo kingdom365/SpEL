@@ -2,9 +2,10 @@ import requests
 import time
 import os
 import pickle
+import json
 
 # 输出目录
-output_dir = 'extracted_texts'
+output_dir = 'json_texts'
 os.makedirs(output_dir, exist_ok=True)
 
 start_entity_id = 2
@@ -32,9 +33,9 @@ def fetch_page(title):
                 entries[title] = text[:128]    
                 print(title, ':', entries[title])
                 if cnt % 100 == 0:
-                    print("Saving pkl.....")
-                    with open(os.path.join(output_dir, "entities_desc_{}.pkl".format(int(cnt / 10))), 'wb') as f:
-                        pickle.dump(entries, f)
+                    print("Saving json.....")
+                    with open(os.path.join(output_dir, "entities_desc_{}.json".format(int(cnt))), 'w') as f:
+                        json.dump(entries, f)
                     entries = dict()
     except Exception as e:
         print('Error occurred, resend now...')
@@ -51,9 +52,9 @@ def fetch_page(title):
                 entries[title] = text[:128]    
                 print(title, ':', entries[title])
                 if cnt % 100 == 0:
-                    print("Saving pkl.....")
-                    with open(os.path.join(output_dir, "entities_desc_{}.pkl".format(int(cnt / 10))), 'wb') as f:
-                        pickle.dump(entries, f)
+                    print("Saving json.....")
+                    with open(os.path.join(output_dir, "entities_desc_{}.json".format(int(cnt))), 'w') as f:
+                        json.dump(entries, f)
                     entries = dict()
         
 
@@ -77,11 +78,11 @@ if __name__ == '__main__':
 
         time.sleep(1)  # 避免触发API速率限制
 
-    with open(os.path.join(output_dir, "entities_desc_{}.pkl".format(int(cnt / 10))), 'wb') as f:
-        pickle.dump(entries, f)
+    with open(os.path.join(output_dir, "entities_desc_{}.json".format(int(cnt))), 'w') as f:
+        json.dump(entries, f)
 
     print(errors)
     if len(errors) > 0:
-        with open(os.path.join(output_dir, 'errors_items.pkl'), 'wb') as f:
-            pickle.dump(errors, f)
+        with open(os.path.join(output_dir, 'errors_items.json'), 'w') as f:
+            json.dump(errors, f)
     print('cnt pt: ', cnt)

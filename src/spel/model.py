@@ -9,7 +9,7 @@ from typing import List
 from glob import glob
 from itertools import chain
 
-from transformers import AutoModelForMaskedLM
+from transformers import AutoModelForMaskedLM, AutoTokenizer
 import torch
 import torch.nn as nn
 from torch import optim
@@ -39,6 +39,32 @@ class SpELAnnotator:
         self.out = None
         self.softmax = None
 
+        self.desc_vocab = None  # 推理时需要所有输入过的
+        self.desc_pad = None    # 
+        self.desc_o = None
+
+    def init_desc_model_from_scratch(self, base_model=BERT_MODEL_NAME, device='cpu'):
+        if base_model:
+            self.bert_lm = AutoModelForMaskedLM.from_pretrained(base_model, output_hidden_states=True,
+                                                                cache_dir=get_checkpoints_dir() / "hf").to(device)
+            self.disable_roberta_lm_head()
+            self.number_of_bert_layers = self.bert_lm.config.num_hidden_layers + 1
+            self.bert_lm_h = self.bert_lm.config.hidden_size
+            self.out = nn.Embedding(num_embeddings=len(dl_sa.mentions_vocab),
+                                    embedding_dim=self.bert_lm_h, sparse=True).to(device)
+            self.softmax = nn.Softmax(dim=-1)
+
+            # [CLS] entity_title [SEP] entity_desc [SEP]
+            self.bert_out_tokenzier = AutoTokenizer.from_pretrained(base_model)
+            self.bert_out = AutoModelForMaskedLM.from_pretrained(base_model, output_hidden_states=True,
+                                                                 cache_dir=get_checkpoints_dir() / 'hf').to(device)
+            self.disable_out_roberta_lm_head()
+            self.number_of_out_bert_layers = self.bert_out.config.num_hidden_layers + 1
+            self.bert_out_h = self.bert_out.config.hidden_size
+            self.desc_pad = nn.Parameter(torch.randn(self.bert_lm_h))
+            self.desc_o = nn.Parameter(torch.randn(self.bert_lm_h))
+            # self.bert_out_vocab = None  # 在推理阶段前，self.bert_out.eval()，然后让entity_desc再编码一次，输出的向量放在这里(vocab_size * num_embedding)
+
     def init_model_from_scratch(self, base_model=BERT_MODEL_NAME, device="cpu"):
         """
         This is required to be called to load up the base model architecture before loading the fine-tuned checkpoint.
@@ -52,7 +78,7 @@ class SpELAnnotator:
             self.out = nn.Embedding(num_embeddings=len(dl_sa.mentions_vocab),
                                     embedding_dim=self.bert_lm_h, sparse=True).to(device)
             self.softmax = nn.Softmax(dim=-1)
-
+            
     def shrink_classification_head_to_aida(self, device):
         """
         This will be called in fine-tuning step 3 to shrink the classification head to in-domain data vocabulary.
@@ -73,6 +99,7 @@ class SpELAnnotator:
         new_out.load_state_dict(new_state_dict, strict=False)
         self.out = new_out.to(device)
         dl_sa.shrink_vocab_to_aida()
+        dl_sa.shrink_desc_vocab_to_aida()
         model_params = sum(p.numel() for p in self.bert_lm.parameters())
         out_params = sum(p.numel() for p in self.out.parameters())
         print(f' * Shrank model to {model_params+out_params} number of parameters ({model_params} parameters '
@@ -88,6 +115,10 @@ class SpELAnnotator:
                                       isinstance(self.bert_lm, nn.parallel.DistributedDataParallel) else self.bert_lm
 
     @property
+    def lm_desc_module(self):
+        return self.bert_out.module if isinstance(self.bert_out, nn.DataParallel) or \
+                                       isinstance(self.bert_out, nn.parallel.DistributedDataParallel) else self.bert_out
+    @property
     def out_module(self):
         return self.out.module if isinstance(self.out, nn.DataParallel) or \
                                   isinstance(self.out, nn.parallel.DistributedDataParallel) else self.out
@@ -95,6 +126,28 @@ class SpELAnnotator:
     @staticmethod
     def get_canonical_redirects(limit_to_conll=True):
         return get_aida_train_canonical_redirects() if limit_to_conll else get_ood_canonical_redirects()
+
+    '''加入实体描述编码的优化器'''
+    def create_desc_optimizers(self, encoder_lr=5e-5, decoder_lr=0.1, exclude_parameter_names_regex=None):
+        if exclude_parameter_names_regex is not None:
+            bert_lm_parameters = list()
+            regex = re.compile(exclude_parameter_names_regex)
+            for n, p in list(self.lm_module.named_parameters()):
+                if not len(regex.findall(n)) > 0:
+                    bert_lm_parameters.append(p)
+            for n, p in list(self.lm_desc_module.named_parameters()):
+                if not len(regex.findall(n)) > 0:
+                    bert_lm_parameters.append(p)
+        else:
+            bert_lm_parameters = list(self.lm_module.parameters())
+            bert_lm_parameters.extend(list(self.lm_desc_module.parameters()))
+        bert_optim = optim.Adam(bert_lm_parameters, lr=encoder_lr)
+        if decoder_lr < 1e-323:
+            # IMPORTANT! This is a hack since if we don't consider an optimizer for the last layer(e.g. decoder_lr=0.0),
+            #  BCEWithLogitsLoss will become unstable and memory will explode.
+            decoder_lr = 1e-323
+        out_optim = optim.SparseAdam(self.out.parameters(), lr=decoder_lr)
+        return bert_optim, out_optim
 
     def create_optimizers(self, encoder_lr=5e-5, decoder_lr=0.1, exclude_parameter_names_regex=None):
         if exclude_parameter_names_regex is not None:
@@ -165,6 +218,52 @@ class SpELAnnotator:
             raw_logits, hidden_states = self.get_model_raw_logits_inference(token_ids, return_hidden_states=True)
             logits = self.get_model_logits_inference(raw_logits, hidden_states, k_for_top_k_to_keep, token_offsets)
             return logits
+    
+    def annotate_subword_ids_desc(self, subword_ids_list: List, k_for_top_k_to_keep: int, token_offsets=None) \
+            -> List[SubwordAnnotation]:
+        with torch.no_grad():
+            token_ids = torch.LongTensor(subword_ids_list)
+            raw_logits, hidden_states = self.get_model_desc_raw_logits_inference(token_ids, return_hidden_states=True)
+            logits = self.get_model_logtis_inference(raw_logits, hidden_states, k_for_top_k_to_keep, token_offsets) 
+            return logits
+
+    '''构建一次entity_desc的集合，直接用于推理'''
+    def gather_all_desc_emb(self):
+        cls_embs = []
+        with torch.no_grad():
+            id_desc_map = sorted(dl_sa.id_desc_map.items(), lambda x: x[0])
+            for _, desc_tensor in id_desc_map:
+                tn = desc_tensor.to(self.device)
+                out_tn = self.bert_out(tn).hidden_states[-1]
+                cls_embs.append(out_tn.cpu())
+            all_embs = [self.desc_o.unsqueeze(0), self.desc_pad.unsqueeze(0)] + cls_embs
+            self.desc_vocab = torch.cat(all_embs, dim=0)
+            self.desc_vocab.to(self.device)
+
+
+    def get_model_desc_raw_logits_training(self, token_ids, descs, label_probs):
+        print(token_ids.shape)
+        enc = self.bert_lm(token_ids).hidden_states[-1]
+        # desc: tensor(batch_size, batch_entity_num, desc_max_length=256)
+        descs_vocab_vec = []
+        # print('descs shape : ', descs.shape)
+        for desc in descs:
+            input_ids = desc["input_ids"].to(self.current_device)
+            attention_mask = desc["attention_mask"].to(self.current_device)
+            print("input_ids shape : ", input_ids.shape)
+            print("attention_mask shape : ", attention_mask.shape)
+            output = self.bert_out(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True).hidden_states[-1][:, 0, :]
+            descs_vocab_vec.append(output.cpu())
+        out = torch.cat(descs_vocab_vec).to(self.current_device)
+        # out = self.bert_out(descs).hidden_states[-1]
+        logits = enc.matmul(out.transpose(0, 1))
+        return logits
+    
+    def get_model_desc_raw_logits_inference(self, token_ids, return_hidden_states=False):
+        encs = self.lm_module(token_ids.to(self.current_device)).hidden_states
+        self.gather_all_desc_emb()
+        logits = encs[-1].matmul(self.desc_vocab.transpose(0, 1))
+        return (logits, encs) if return_hidden_states else logits
 
     def get_model_raw_logits_training(self, token_ids, label_ids, label_probs):
         # label_probs is not used in this function but provided for the classes inheriting SpELAnnotator.
@@ -190,6 +289,88 @@ class SpELAnnotator:
         out = self.out_module.weight
         logits = encs[-1].matmul(out.transpose(0, 1))
         return (logits, encs) if return_hidden_states else logits
+
+    def evaluate_new(self, epoch, batch_size, label_size, best_f1, is_training=True, use_retokenized_wikipedia_data=False,
+                 potent_score_threshold=0.82):
+        self.bert_lm.eval()
+        self.bert_out.eval()
+        vocab_pad_id = dl_sa.mentions_vocab['<pad>']
+
+        all_words, all_tags, all_y, all_y_hat, all_predicted, all_token_ids = [], [], [], [], [], []
+        subword_eval = InOutMentionEvaluationResult(vocab_index_of_o=dl_sa.mentions_vocab['|||O|||'])
+        dataset_name = store_validation_data_wiki(
+            self.checkpoints_root, batch_size, label_size, is_training=is_training,
+            use_retokenized_wikipedia_data=use_retokenized_wikipedia_data)
+        with torch.no_grad():
+            for d_file in tqdm(sorted(glob(os.path.join(self.checkpoints_root, dataset_name, "*")))):
+                batch_token_ids, label_ids, label_probs, eval_mask, label_id_to_entity_id_dict, \
+                    batch_entity_ids, is_in_mention, _ = pickle.load(open(d_file, "rb"))
+                logits = self.get_model_desc_raw_logits_inference(batch_token_ids)
+                subword_eval.update_scores(eval_mask, is_in_mention, logits)
+                y_hat = logits.argmax(-1)
+
+                tags = list()
+                predtags = list()
+                y_resolved_list = list()
+                y_hat_resolved_list = list()
+                token_list = list()
+
+                for batch_id, seq in enumerate(label_probs.max(-1)[1]):
+                    for token_id, label_id in enumerate(seq[:-self.text_chunk_overlap]):
+                        if eval_mask[batch_id][token_id].item() == 0:
+                            y_resolved = vocab_pad_id
+                        else:
+                            y_resolved = label_ids[label_id].item()
+                        y_resolved_list.append(y_resolved)
+                        tags.append(dl_sa.mentions_itos[y_resolved])
+                        y_hat_resolved = y_hat[batch_id][token_id].item()
+                        y_hat_resolved_list.append(y_hat_resolved)
+                        predtags.append(dl_sa.mentions_itos[y_hat_resolved])
+                        token_list.append(batch_token_ids[batch_id][token_id].item())
+
+                all_y.append(y_resolved_list)
+                all_y_hat.append(y_hat_resolved_list)
+                all_tags.append(tags)
+                all_predicted.append(predtags)
+                all_words.append(tokenizer.convert_ids_to_tokens(token_list))
+                all_token_ids.append(token_list)
+                del batch_token_ids, label_ids, label_probs, eval_mask, \
+                    label_id_to_entity_id_dict, batch_entity_ids, logits, y_hat
+
+        y_true = numpy.array(list(chain(*all_y)))
+        y_pred = numpy.array(list(chain(*all_y_hat)))
+        all_token_ids = numpy.array(list(chain(*all_token_ids)))
+
+        num_proposed = len(y_pred[(1 < y_pred) & (all_token_ids > 0)])
+        num_correct = (((y_true == y_pred) & (1 < y_true) & (all_token_ids > 0))).astype(int).sum()
+        num_gold = len(y_true[(1 < y_true) & (all_token_ids > 0)])
+
+        precision = num_correct / num_proposed if num_proposed > 0.0 else 0.0
+        recall = num_correct / num_gold if num_gold > 0.0 else 0.0
+        f1 = 2.0 * precision * recall / (precision + recall) if precision + recall > 0.0 else 0.0
+        f05 = 1.5 * precision * recall / (precision + recall) if precision + recall > 0.0 else 0.0
+        if f1 > best_f1:
+            print("Saving the best checkpoint ...")
+            config = self.prepare_model_checkpoint(epoch)
+            fname = self.get_mode_checkpoint_name()
+            torch.save(config, f"{fname}.pt")
+            print(f"weights were saved to {fname}.pt")
+        if precision > potent_score_threshold and recall > potent_score_threshold and is_training:
+            print(f"Saving the potent checkpoint with both precision and recall above {potent_score_threshold} ...")
+            config = self.prepare_model_checkpoint(epoch)
+            try:
+                fname = self.get_mode_checkpoint_name()
+                torch.save(config, f"{fname}-potent.pt")
+                print(f"weights were saved to {fname}-potent.pt")
+            except NotImplementedError:
+                pass
+        self.bert_lm.train()
+        # self.out.train()
+        self.bert_out.train()
+        with open(self.exec_run_file, "a+") as exec_file:
+            exec_file.write(f"{precision}, {recall}, {f1}, {f05}, {num_proposed}, {num_correct}, {num_gold}, "
+                            f"{epoch+1},,\n")
+        return precision, recall, f1, f05, num_proposed, num_correct, num_gold, subword_eval
 
     def evaluate(self, epoch, batch_size, label_size, best_f1, is_training=True, use_retokenized_wikipedia_data=False,
                  potent_score_threshold=0.82):
@@ -272,6 +453,37 @@ class SpELAnnotator:
                             f"{epoch+1},,\n")
         return precision, recall, f1, f05, num_proposed, num_correct, num_gold, subword_eval
 
+    def inference_evaluate_new(self, epoch, best_f1, dataset_name='testa'):
+        self.bert_lm.eval()
+        self.bert_out.eval()
+        evaluation_results = EntityEvaluationScores(dataset_name)
+        gold_documents = get_aida_set_phrase_splitted_documents(dataset_name)
+        for gold_document in tqdm(gold_documents):
+            t_sentence = " ".join([x.word_string for x in gold_document])
+            predicted_document = chunk_annotate_and_merge_to_phrase(self, t_sentence, k_for_top_k_to_keep=1)
+            comparison_results = compare_gold_and_predicted_annotation_documents(gold_document, predicted_document)
+            g_md = set((e[1].begin_character, e[1].end_character)
+                       for e in comparison_results if e[0].resolved_annotation)
+            p_md = set((e[1].begin_character, e[1].end_character)
+                       for e in comparison_results if e[1].resolved_annotation)
+            g_el = set((e[1].begin_character, e[1].end_character, dl_sa.mentions_itos[e[0].resolved_annotation])
+                       for e in comparison_results if e[0].resolved_annotation)
+            p_el = set((e[1].begin_character, e[1].end_character, dl_sa.mentions_itos[e[1].resolved_annotation])
+                       for e in comparison_results if e[1].resolved_annotation)
+            if p_el:
+                evaluation_results.record_mention_detection_results(p_md, g_md)
+                evaluation_results.record_entity_linking_results(p_el, g_el)
+        if evaluation_results.micro_entity_linking.f1.compute() > best_f1:
+            print("Saving the best checkpoint ...")
+            config = self.prepare_model_checkpoint(epoch)
+            fname = self.get_mode_checkpoint_name()
+            torch.save(config, f"{fname}.pt")
+            print(f"weights were saved to {fname}.pt")
+        self.bert_lm.train()
+        self.out.train()
+        return evaluation_results
+
+
     def inference_evaluate(self, epoch, best_f1, dataset_name='testa'):
         self.bert_lm.eval()
         self.out.eval()
@@ -324,6 +536,14 @@ class SpELAnnotator:
         self.bert_lm.lm_head.dense.bias.requires_grad = False
         self.bert_lm.lm_head.dense.weight.requires_grad = False
         self.bert_lm.lm_head.decoder.bias.requires_grad = False
+
+    def disable_out_roberta_lm_head(self):
+        assert self.bert_out is not None
+        self.bert_out.lm_head.layer_norm.bias.requires_grad = False
+        self.bert_out.lm_head.layer_norm.weight.requires_grad = False
+        self.bert_out.lm_head.dense.bias.requires_grad = False
+        self.bert_out.lm_head.dense.weight.requires_grad = False
+        self.bert_out.lm_head.decoder.bias.requires_grad = False
 
     def _load_from_checkpoint_object(self, checkpoint, device="cpu"):
         torch.cuda.empty_cache()
