@@ -59,7 +59,6 @@ class StaticAccess:
         self.mentions_vocab, self.mentions_itos = None, None
         self.mentions_desc_vocab = None
         self.id_desc_map = None
-        self.precomputed_desc_embs = None   # 利用RoBERTa本身已经具有的
         self.set_vocab_and_itos_to_all()
         self.aida_canonical_redirects = get_aida_train_canonical_redirects()
         self._all_vocab_mask_for_aida = None
@@ -348,7 +347,7 @@ def create_id_desc_map():
             truncation=True,
             return_attention_mask=True,
             return_tensors='pt')
-        ret_id_desc_map[idx] = token_seq
+        ret_id_desc_map[idx] = token_seq["input_ids"]
     # (entity_id: desc_tensor)
     ret_id_desc_map = dict(sorted(ret_id_desc_map.items()))
     desc_idxs = set([i for i in range(len(dl_sa.mentions_vocab))])
@@ -368,12 +367,9 @@ def create_id_desc_map():
             truncation=True,
             return_attention_mask=True,
             return_tensors='pt')
-        ret_id_desc_map[idx] = token_seq
+        ret_id_desc_map[idx] = token_seq["input_ids"]
+    ret_id_desc_map = dict(sorted(ret_id_desc_map.items()))
     dl_sa.id_desc_map = ret_id_desc_map
-
-def precompute_aida_desc_embs():
-    
-    pass
 
 def get_dataset_aida(split: str, batch_size: int, get_labels_with_high_model_score=None,
                 label_size: int = 0, load_distributed: bool = False, world_size: int = 1, rank: int = 0,

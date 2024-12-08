@@ -76,6 +76,7 @@ class FinetuneS3(SpELAnnotator):
                 get_dataset_aida(split='train', batch_size=batch_size, label_size=label_size,
                             get_labels_with_high_model_score=self.get_highest_confidence_model_predictions)
             ))
+            self.create_dict_after_getdata()
             total_loss = 0
             cnt_loss = 0
             for iter_, (inputs, subword_mentions) in _iter_:
@@ -84,7 +85,7 @@ class FinetuneS3(SpELAnnotator):
                 # logits = self.get_model_raw_logits_training(
                 #     inputs.token_ids.to(device), subword_mentions.ids.to(device), subword_mentions_probs)
                 logits = self.get_model_desc_raw_logits_training(
-                    inputs.token_ids.to(device), subword_mentions.desc.to(device), subword_mentions_probs)
+                    inputs.token_ids.to(device), subword_mentions.ids.to(device), subword_mentions_probs)
                 logits = logits.view(-1)  # (N*T, VOCAB)
                 label_probs = subword_mentions_probs.view(-1)  # (N*T,)
 
@@ -244,7 +245,7 @@ if __name__ == '__main__':
         b_annotator = FinetuneS3()
         # b_annotator.finetune(checkpoint_name=None, n_epochs=60, batch_size=10, bert_dropout=0.2, label_size=10240,
         #                      eval_batch_size=2)
-        b_annotator.finetune_new(checkpoint_name=None, n_epochs=60, batch_size=2, bert_dropout=0.2, label_size=10240,
+        b_annotator.finetune_new(checkpoint_name=None, n_epochs=60, batch_size=10, bert_dropout=0.2, label_size=10240,
                              eval_batch_size=2)
     finally:
         if TRACK_WITH_WANDB:

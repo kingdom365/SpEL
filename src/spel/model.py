@@ -56,15 +56,39 @@ class SpELAnnotator:
 
             # [CLS] entity_title [SEP] entity_desc [SEP]
             # self.bert_out_tokenzier = AutoTokenizer.from_pretrained(base_model)
-            self.desc_embs = [dl_sa.mention_vocab]
+            # self.desc_embs = [dl_sa.mention_vocab]
+            # 一次性组织roberta-desc嵌入
             self.bert_out = AutoModelForMaskedLM.from_pretrained(base_model, output_hidden_states=True,
                                                                  cache_dir=get_checkpoints_dir() / 'hf').to(device)
             self.disable_out_roberta_lm_head()
+            self.desc_embs = None
+            
             self.number_of_out_bert_layers = self.bert_out.config.num_hidden_layers + 1
             self.bert_out_h = self.bert_out.config.hidden_size
             self.desc_pad = nn.Parameter(torch.randn(self.bert_lm_h))
             self.desc_o = nn.Parameter(torch.randn(self.bert_lm_h))
             # self.bert_out_vocab = None  # 在推理阶段前，self.bert_out.eval()，然后让entity_desc再编码一次，输出的向量放在这里(vocab_size * num_embedding)
+
+    def create_dict_after_getdata(self):
+        with torch.no_grad():
+            tns = []
+            for idx, desc in dl_sa.id_desc_map.items():
+                # print('desc shape : ', desc.shape)
+                # desc_input = desc.squeeze(0)
+                # out_tn = desc.to(self.current_device)
+                tns.append(desc)
+            outs = []
+            for i in range(0, len(tns), 10):
+                mid_tns = []
+                for j in range(i, min(i + 10, len(tns))):
+                    mid_tns.append(tns[j])
+                mid_inputs = torch.stack(mid_tns).to(self.current_device)
+                mid_inputs = mid_inputs.squeeze(1)
+                out_part = self.bert_out(mid_inputs).hidden_states[-1][:,0,:]
+                outs.append(out_part)
+            outs = torch.stack(outs).flatten(start_dim=0, end_dim=1)
+            print('out shape: ', outs.shape)            
+            self.desc_embs = outs
 
     def init_model_from_scratch(self, base_model=BERT_MODEL_NAME, device="cpu"):
         """
@@ -229,32 +253,34 @@ class SpELAnnotator:
             return logits
 
     '''构建一次entity_desc的集合，直接用于推理'''
-    def gather_all_desc_emb(self):
-        cls_embs = []
-        with torch.no_grad():
-            id_desc_map = sorted(dl_sa.id_desc_map.items(), lambda x: x[0])
-            for _, desc_tensor in id_desc_map:
-                tn = desc_tensor.to(self.device)
-                out_tn = self.bert_out(tn).hidden_states[-1]
-                cls_embs.append(out_tn.cpu())
-            all_embs = [self.desc_o.unsqueeze(0), self.desc_pad.unsqueeze(0)] + cls_embs
-            self.desc_vocab = torch.cat(all_embs, dim=0)
-            self.desc_vocab.to(self.device)
+    # def gather_all_desc_emb(self):
+    #     cls_embs = []
+    #     with torch.no_grad():
+    #         id_desc_map = sorted(dl_sa.id_desc_map.items(), lambda x: x[0])
+    #         for _, desc_tensor in id_desc_map:
+    #             tn = desc_tensor.to(self.device)
+    #             out_tn = self.bert_out(tn).hidden_states[-1]
+    #             cls_embs.append(out_tn.cpu())
+    #         all_embs = [self.desc_o.unsqueeze(0), self.desc_pad.unsqueeze(0)] + cls_embs
+    #         self.desc_vocab = torch.cat(all_embs, dim=0)
+    #         self.desc_vocab.to(self.device)
 
 
-    def get_model_desc_raw_logits_training(self, token_ids, descs, label_probs):
-        print(token_ids.shape)
+    def get_model_desc_raw_logits_training(self, token_ids, label_ids, label_probs):
+        # print(token_ids.shape)
         enc = self.bert_lm(token_ids).hidden_states[-1]
-        print('descs shape : ', descs.shape)
-        out = self.bert_out(descs).hidden_states[-1][:, 0, :]
+        # print('descs shape : ', descs.shape)
+        # print('desc shape : ', self.desc_embs.shape)
+        # out = self.bert_out(self).hidden_states[-1][:, 0, :]
         # out = self.bert_out(descs).hidden_states[-1]
+        out = torch.index_select(self.desc_embs, dim=0, index=label_ids)
         logits = enc.matmul(out.transpose(0, 1))
         return logits
     
     def get_model_desc_raw_logits_inference(self, token_ids, return_hidden_states=False):
         encs = self.lm_module(token_ids.to(self.current_device)).hidden_states
-        self.gather_all_desc_emb()
-        logits = encs[-1].matmul(self.desc_vocab.transpose(0, 1))
+        # self.gather_all_desc_emb()
+        logits = encs[-1].matmul(self.desc_embs.transpose(0, 1))
         return (logits, encs) if return_hidden_states else logits
 
     def get_model_raw_logits_training(self, token_ids, label_ids, label_probs):
